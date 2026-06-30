@@ -50,6 +50,8 @@ import torch
 import trimesh
 from scipy.spatial.transform import Rotation as R_scipy
 
+from .tcp_frames import PANDA_HAND_TO_FINGERTIP_Z_M, fingertip_pose_to_hand_pose
+
 # ---------------------------------------------------------------------------
 # curobo v0.7 imports — guarded; only needed by functions NOT yet ported.
 # These packages no longer exist in v0.8.0; the try/except lets the module
@@ -146,7 +148,7 @@ except Exception:  # noqa: BLE001 — warp absent/old: leave as-is
 #   finger body at pos="0 0 0.0584" from panda_hand
 #   main fingertip pad (fingertip_pad_collision_1) at pos="0 0.0055 0.0445" in finger body frame
 # Total: 0.0584 + 0.0445 = 0.1029 m
-FRANKA_HAND_TO_FINGERTIP_Z_M = 0.0584 + 0.0445
+FRANKA_HAND_TO_FINGERTIP_Z_M = PANDA_HAND_TO_FINGERTIP_Z_M
 
 # ---------------------------------------------------------------------------
 # Robot-specific registries — keyed by CuRobo robot config filename.
@@ -600,14 +602,19 @@ def _pick_nearest_solution(q_solutions: np.ndarray, q_ref: np.ndarray) -> np.nda
 def _grasp_pose_fingertip_to_hand(
     position: np.ndarray,
     quat_wxyz: np.ndarray,
-    hand_to_fingertip_z: float = FRANKA_HAND_TO_FINGERTIP_Z_M,
-) -> np.ndarray:
+    hand_to_fingertip_z: float | None = None,
+    tcp_rotation_z: float | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
     """Convert grasp position from gripper fingertip frame to panda_hand (EE) frame.
-    Grasp nets typically output pose for the fingertip center; CuRobo plans for panda_hand.
-    Returns new position (3,) in world frame; orientation is unchanged."""
-    R = R_scipy.from_quat(np.roll(np.asarray(quat_wxyz), -1)).as_matrix()  # wxyz -> xyzw for scipy
-    offset_world = R @ np.array([0.0, 0.0, hand_to_fingertip_z])
-    return np.asarray(position, dtype=np.float64) - offset_world
+    Grasp nets typically output a fingertip/TCP pose; CuRobo plans for
+    panda_hand. Tool length and mount yaw default to Panda values and can be
+    supplied by an embodiment adapter through the GAP_* environment variables."""
+    return fingertip_pose_to_hand_pose(
+        position,
+        quat_wxyz,
+        hand_to_fingertip_z=hand_to_fingertip_z,
+        tcp_rotation_z=tcp_rotation_z,
+    )
 
 
 def save_world_and_robot_spheres_debug(
@@ -1227,7 +1234,7 @@ def plan_to_grasp_poses(
             if grasp_z_clearance != 0.0:
                 pos = pos.copy()
                 pos[2] += grasp_z_clearance
-            pos = _grasp_pose_fingertip_to_hand(pos, quat)
+            pos, quat = _grasp_pose_fingertip_to_hand(pos, quat)
             print(
                 f"[plan_to_grasp_poses] grasp {idx}/{n}: position "
                 f"(panda_hand after offset, z_clearance={grasp_z_clearance}): "

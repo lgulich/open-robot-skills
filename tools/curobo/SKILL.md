@@ -65,7 +65,10 @@ them per call corrupts CUDA graph state).
 - **Frames**: grasp/target poses are in the robot-base frame (cuRobo treats
   the robot base as world origin). With `grasp_pose_is_fingertip=True`
   (default) grasp positions are fingertip-pad centers and converted to the
-  `panda_hand` frame solver-side (offset 0.1029 m along hand Z).
+  `panda_hand` frame solver-side. The default is the Panda transform (offset
+  0.1029 m along hand Z, zero mount yaw). Embodiment adapters may set
+  `GAP_HAND_TO_FINGERTIP_Z` and `GAP_TCP_ROTATION_Z` for a different tool;
+  both values are inherited by the out-of-process cuRobo bundle.
 - **Ignore the grasp target**: pass its mesh name in
   `ignore_obstacle_names` for `plan_to_grasp_poses` /
   `batch_grasp_feasibility` — closing on the target is not a collision.
