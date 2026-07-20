@@ -430,6 +430,58 @@ def query(
     return {"text": _query(prompt, image, images, provider, model)}
 
 
+class QueryBatchResult(TypedDict):
+    texts: list  # str per request, or None where that request failed
+
+
+@tool(
+    name="vlm.query_batch",
+    summary="Run several independent vlm.query requests concurrently.",
+    tags=("perception",),
+)
+def query_batch(
+    requests: list,
+    provider: str | None = None,
+    model: str | None = None,
+    max_workers: int = 4,
+) -> QueryBatchResult:
+    """Fan out independent VLM queries inside ONE tool call.
+
+    Each request is ``{"prompt": str, "image": uint8 [H, W, 3] (optional)}``
+    and is answered by exactly the same per-request path as ``vlm.query``
+    (same provider dispatch, same payload shape, one HTTP client per
+    request — the provider functions build a fresh client per call, so
+    concurrent execution shares no state). Order is preserved.
+
+    Concurrency lives here rather than in callers because the runtime's
+    ``ctx.tool`` surface (guard counters, call tracing) is not
+    thread-safe; a caller batching N sub-queries through this single tool
+    call keeps the trace and guard bookkeeping sequential.
+
+    Per-request failures never fail the batch: the corresponding slot in
+    ``texts`` is ``None`` and callers apply their own fallbacks.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    if not isinstance(requests, list) or not requests:
+        raise ToolError("vlm", "query_batch requires a non-empty request list")
+
+    def one(req: dict) -> str | None:
+        try:
+            return _query(
+                req["prompt"], req.get("image"), req.get("images"),
+                provider, model,
+            )
+        except Exception as exc:  # noqa: BLE001 — per-item isolation
+            logger.warning("vlm.query_batch item failed: %s", exc)
+            return None
+
+    workers = max(1, min(int(max_workers), len(requests), 8))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        texts = list(pool.map(one, requests))
+    return {"texts": texts}
+
+
 #: Appended to every ``query_yes_no`` prompt so the reply is machine-checkable.
 #: The dev servicer relied on temperature-0 replies leading with "Yes,"/"No,"
 #: and coerced with a bare ``"yes" in text.lower()``; without an explicit

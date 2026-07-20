@@ -371,6 +371,8 @@ def _tournament(
         return -1
     if len(crops) == 1:
         return keep[0]
+    if os.environ.get("CAP_VLM_FAST_TOURNAMENT", "0") == "1":
+        return _fast_tournament(ctx, crops, keep, object_name, object_description)
 
     bracket = list(range(len(crops)))
     while len(bracket) > 1:
@@ -404,6 +406,93 @@ def _tournament(
                 raise
             win = a if _parse_letter(resp["text"], 2) == 0 else b
             nxt.append(win)
+        bracket = nxt
+    return keep[bracket[0]]
+
+
+#: Cross-cycle pairwise-verdict cache (CAP_VLM_FAST_TOURNAMENT=1 only).
+#: Keyed on the exact crop bytes + question, so a hit is byte-identical
+#: input -> the recorded VLM verdict is definitionally the same answer.
+#: In-process only: one GaP process serves one episode, and it is the
+#: repeat pick cycles WITHIN an episode that re-compare the same
+#: still-unmoved objects.
+_PAIR_CACHE: dict = {}
+
+
+def _pair_cache_key(crop_a, crop_b, object_name: str, object_description: str) -> str:
+    h = hashlib.sha256()
+    h.update(np.ascontiguousarray(crop_a).tobytes())
+    h.update(b"|")
+    h.update(np.ascontiguousarray(crop_b).tobytes())
+    h.update(f"|{object_name}|{object_description}|".encode("utf-8"))
+    h.update(os.environ.get("GAP_VLM_PROVIDER", "").encode("utf-8"))
+    h.update(os.environ.get("GAP_VLM_MODEL", "").encode("utf-8"))
+    return h.hexdigest()
+
+
+def _fast_tournament(
+    ctx: Any,
+    crops: list,
+    keep: list,
+    object_name: str,
+    object_description: str,
+) -> int:
+    """The same single-elimination bracket as ``_tournament``, with two
+    latency (not semantics) changes, gated by ``CAP_VLM_FAST_TOURNAMENT=1``:
+
+    - matches within one round are independent, so their queries go through
+      ONE ``vlm.query_batch`` call and run concurrently inside the tool
+      (``ctx.tool`` itself is not thread-safe, the batch tool is);
+    - each pair verdict is cached on the exact crop bytes, so the repeat
+      pick cycles of a multi-object episode do not re-ask the VLM about
+      the same still-unmoved objects.
+
+    Identical prompts, identical pair sheets, identical winner rule
+    (unparseable answer -> B, matching ``_tournament``), and the same
+    fail-loud contract: a failed query raises so the subgraph exits via
+    ``on_error`` instead of silently mis-picking.
+    """
+    prompt = load_prompt(
+        __package__, "vlm_pairwise",
+        object_name=object_name,
+        object_description=object_description,
+    )
+    bracket = list(range(len(crops)))
+    while len(bracket) > 1:
+        nxt: list[int] = []
+        pending: list[tuple[int, int, int, str]] = []  # (slot, a, b, key)
+        for j in range(0, len(bracket), 2):
+            if j + 1 >= len(bracket):
+                nxt.append(bracket[j])           # bye
+                continue
+            a, b = bracket[j], bracket[j + 1]
+            key = _pair_cache_key(crops[a], crops[b], object_name, object_description)
+            cached = _PAIR_CACHE.get(key)
+            if cached is not None:
+                nxt.append(a if cached == 0 else b)
+                continue
+            nxt.append(-1)                       # placeholder, filled below
+            pending.append((len(nxt) - 1, a, b, key))
+        if pending:
+            requests = [
+                {"prompt": prompt, "image": _make_pair_sheet(crops[a], crops[b])}
+                for _, a, b, _ in pending
+            ]
+            try:
+                resp = ctx.tool("vlm.query_batch", requests=requests)
+            except Exception as exc:
+                _maybe_warn_auth_once(exc)
+                raise
+            texts = resp["texts"]
+            for (slot, a, b, key), text in zip(pending, texts):
+                if text is None:
+                    # Same contract as the sequential path: a failed query
+                    # is a raised error, never a silent slot-A/B pick.
+                    raise RuntimeError(
+                        "vlm.query_batch reported a failed pairwise query")
+                verdict = 0 if _parse_letter(text, 2) == 0 else 1
+                _PAIR_CACHE[key] = verdict
+                nxt[slot] = a if verdict == 0 else b
         bracket = nxt
     return keep[bracket[0]]
 
