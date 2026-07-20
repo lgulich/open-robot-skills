@@ -27,6 +27,7 @@ gap:
   tools:
     - vlm.query: Free-form visual question answering via a hosted VLM.
     - vlm.query_yes_no: Yes/no visual question answering; coerces the model reply to a bool.
+    - vlm.query_batch: Run several independent vlm.query requests concurrently inside one call.
 ---
 
 # vlm
