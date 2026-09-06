@@ -27,7 +27,7 @@ from typing import Any, TypedDict
 
 import numpy as np
 from gap_core.errors import PerceptionFailed, ToolError
-from gap_core.tools import tool
+from gap_core.tools import tool, tool_batch
 from gap_core.types import BoundingBox2D, Mask
 
 logger = logging.getLogger(__name__)
@@ -79,6 +79,7 @@ def prefetch() -> None:
     snapshot_download(repo_id=_SAM3_HF_REPO, repo_type="model")
     logger.info("[sam3] prefetch complete (cached at HF default)")
 
+
 # Cap how many detections segment_text returns by default.  The model emits
 # one mask per detected instance — on cluttered scenes that can be ~200, each
 # ~1 MB at 1280x720 (uint8 0/255).  Most callers consume only ``masks[0]``.
@@ -105,9 +106,9 @@ _DRIFT_MAX_CONSECUTIVE = 5
 
 
 class SegmentTextResult(TypedDict):
-    masks: list[Mask]              # uint8 [H, W], 0 background / 255 foreground
-    scores: list[float]            # confidence per mask, best-first
-    boxes: list[BoundingBox2D]     # tight boxes (text prompt only)
+    masks: list[Mask]  # uint8 [H, W], 0 background / 255 foreground
+    scores: list[float]  # confidence per mask, best-first
+    boxes: list[BoundingBox2D]  # tight boxes (text prompt only)
 
 
 class SegmentResult(TypedDict):
@@ -116,7 +117,7 @@ class SegmentResult(TypedDict):
 
 
 class TrackerInitResult(TypedDict):
-    tracker_id: str                # opaque session id; "" when nothing detected
+    tracker_id: str  # opaque session id; "" when nothing detected
     initial_mask: Mask | None
     initial_box: BoundingBox2D | None
     score: float
@@ -185,9 +186,7 @@ def _get_tracker_predictor() -> Any:
             # Single-GPU mode: gpus_to_use of size 1 means world_size=1 and no
             # worker processes are spawned, so we can call predictor.model
             # directly from this process.
-            gpu_id = (
-                torch.cuda.current_device() if torch.cuda.is_available() else 0
-            )
+            gpu_id = torch.cuda.current_device() if torch.cuda.is_available() else 0
             logger.info("Loading SAM3 video predictor (single GPU, dev=%d) ...", gpu_id)
             # Disable temporal disambiguation. The default build uses
             # hotstart_delay=15 + hotstart_unmatch_thresh=8 + masklet
@@ -269,9 +268,7 @@ def _autocast(device: str):
     import torch
 
     return (
-        torch.autocast(device, dtype=torch.bfloat16)
-        if "cuda" in device
-        else torch.autocast("cpu")
+        torch.autocast(device, dtype=torch.bfloat16) if "cuda" in device else torch.autocast("cpu")
     )
 
 
@@ -331,9 +328,7 @@ def segment_text(
     try:
         with _autocast(_DEVICE):
             inference_state = processor.set_image(pil_image)
-            output = processor.set_text_prompt(
-                state=inference_state, prompt=query
-            )
+            output = processor.set_text_prompt(state=inference_state, prompt=query)
     except Exception as e:
         raise PerceptionFailed(f"SAM3 inference failed: {e}") from e
 
@@ -344,6 +339,21 @@ def segment_text(
     if masks_tensor is None or boxes_tensor is None:
         return {"masks": [], "scores": [], "boxes": []}
 
+    return _format_segment_text_result(
+        masks_tensor,
+        boxes_tensor,
+        scores_tensor,
+        max_results=max_results,
+    )
+
+
+def _format_segment_text_result(
+    masks_tensor: Any,
+    boxes_tensor: Any,
+    scores_tensor: Any,
+    *,
+    max_results: int,
+) -> SegmentTextResult:
     masks_np = _to_numpy(masks_tensor)
     boxes_np = _to_numpy(boxes_tensor)
     scores_np = _to_numpy(scores_tensor)
@@ -372,6 +382,123 @@ def segment_text(
         boxes_out.append(_box_dict(boxes_np[i]))
 
     return {"masks": masks_out, "scores": scores_out, "boxes": boxes_out}
+
+
+def _run_segment_text_batch(
+    prepared: list[tuple[Any, str, int]],
+) -> list[SegmentTextResult]:
+    """Run one inference-only SAM3 batch, including tensor postprocessing."""
+    import torch
+
+    try:
+        with torch.inference_mode():
+            return _run_segment_text_batch_impl(prepared)
+    except Exception as exc:
+        raise PerceptionFailed(f"SAM3 batched inference failed: {exc}") from exc
+
+
+def _run_segment_text_batch_impl(
+    prepared: list[tuple[Any, str, int]],
+) -> list[SegmentTextResult]:
+    """SAM3 batch implementation; caller owns the inference-mode context."""
+    import torch
+    from sam3.model import box_ops
+    from sam3.model.data_misc import FindStage, interpolate
+
+    model, processor = _get_model()
+    images = [item[0] for item in prepared]
+    prompts = [item[1] for item in prepared]
+    device = processor.device
+    batch_size = len(prepared)
+
+    with _autocast(_DEVICE):
+        state = processor.set_image_batch(images)
+        state["backbone_out"].update(model.backbone.forward_text(prompts, device=device))
+        item_ids = torch.arange(batch_size, device=device, dtype=torch.long)
+        find_stage = FindStage(
+            img_ids=item_ids,
+            text_ids=item_ids,
+            input_boxes=None,
+            input_boxes_mask=None,
+            input_boxes_label=None,
+            input_points=None,
+            input_points_mask=None,
+        )
+        output = model.forward_grounding(
+            backbone_out=state["backbone_out"],
+            find_input=find_stage,
+            geometric_prompt=model._get_dummy_prompt(num_prompts=batch_size),
+            find_target=None,
+        )
+        probabilities = (
+            output["pred_logits"].sigmoid() * output["presence_logit_dec"].sigmoid().unsqueeze(1)
+        ).squeeze(-1)
+        boxes = box_ops.box_cxcywh_to_xyxy(output["pred_boxes"])
+        masks = output["pred_masks"]
+
+        results: list[SegmentTextResult] = []
+        for index, (image, _prompt, max_results) in enumerate(prepared):
+            image_h, image_w = image.height, image.width
+            keep = probabilities[index] > processor.confidence_threshold
+            item_scores = probabilities[index][keep]
+            item_boxes = boxes[index][keep]
+            item_masks = masks[index][keep]
+            scale = torch.tensor(
+                [image_w, image_h, image_w, image_h],
+                device=item_boxes.device,
+                dtype=item_boxes.dtype,
+            )
+            item_boxes = item_boxes * scale[None, :]
+            item_masks = interpolate(
+                item_masks.unsqueeze(1),
+                (image_h, image_w),
+                mode="bilinear",
+                align_corners=False,
+            ).sigmoid()
+            results.append(
+                _format_segment_text_result(
+                    item_masks > 0.5,
+                    item_boxes,
+                    item_scores,
+                    max_results=max_results,
+                )
+            )
+    return results
+
+
+@tool_batch(name="sam3.segment_text", max_batch_size=2, max_wait_ms=10)
+def segment_text_batch(
+    requests: list[dict[str, Any]],
+) -> list[SegmentTextResult | BaseException]:
+    """Private serving handler; the public scalar tool interface is unchanged."""
+    results: list[SegmentTextResult | BaseException | None] = [None] * len(requests)
+    prepared: list[tuple[Any, str, int]] = []
+    indices: list[int] = []
+    for index, request in enumerate(requests):
+        try:
+            prepared.append(
+                (
+                    _to_pil(request["image"]),
+                    str(request["query"]),
+                    int(request.get("max_results", _SEGMENT_TEXT_TOP_K)),
+                )
+            )
+            indices.append(index)
+        except BaseException as exc:
+            results[index] = exc
+
+    if prepared:
+        try:
+            batched_results = _run_segment_text_batch(prepared)
+            for index, result in zip(indices, batched_results, strict=True):
+                results[index] = result
+        except BaseException as exc:
+            for index in indices:
+                results[index] = exc
+
+    return [
+        result if result is not None else RuntimeError("missing batch result") for result in results
+    ]
 
 
 @tool(
@@ -439,15 +566,11 @@ def segment_box(
         with _autocast(_DEVICE):
             inference_state = processor.set_image(pil_image)
 
-            box_np = np.array(
-                [box["x1"], box["y1"], box["x2"], box["y2"]], dtype=np.float32
-            )
+            box_np = np.array([box["x1"], box["y1"], box["x2"], box["y2"]], dtype=np.float32)
             kwargs: dict[str, Any] = {"box": box_np, "multimask_output": True}
 
             if use_point:
-                kwargs["point_coords"] = np.array(
-                    [[pixel_x, pixel_y]], dtype=np.float32
-                )
+                kwargs["point_coords"] = np.array([[pixel_x, pixel_y]], dtype=np.float32)
                 kwargs["point_labels"] = np.array([1], dtype=np.int64)
 
             masks, scores, _ = model.predict_inst(inference_state, **kwargs)
@@ -512,10 +635,12 @@ _table_lock = threading.Lock()
 
 def _close_video_session(predictor: Any, video_session_id: str) -> None:
     try:
-        predictor.handle_request({
-            "type": "close_session",
-            "session_id": video_session_id,
-        })
+        predictor.handle_request(
+            {
+                "type": "close_session",
+                "session_id": video_session_id,
+            }
+        )
     except Exception:
         logger.debug("close_session failed", exc_info=True)
 
@@ -525,9 +650,7 @@ def _reap_stale_sessions(predictor: Any, ttl_s: float = _DEFAULT_TTL_S) -> None:
     servicer's background reaper thread)."""
     now = time.monotonic()
     with _table_lock:
-        stale = [
-            tid for tid, s in _sessions.items() if (now - s.last_touched) > ttl_s
-        ]
+        stale = [tid for tid, s in _sessions.items() if (now - s.last_touched) > ttl_s]
         for tid in stale:
             sess = _sessions.pop(tid, None)
             if sess is not None:
@@ -569,7 +692,9 @@ def tracker_init(
 
     if box is not None and box["x2"] > box["x1"] and box["y2"] > box["y1"]:
         bbox_norm_xywh = _xyxy_to_normalized_xywh(
-            (box["x1"], box["y1"], box["x2"], box["y2"]), image_w, image_h,
+            (box["x1"], box["y1"], box["x2"], box["y2"]),
+            image_w,
+            image_h,
         )
         prompt_kind = "box"
     elif use_point:
@@ -579,8 +704,10 @@ def tracker_init(
         py = float(pixel_y) / image_h
         half = 0.05
         bbox_norm_xywh = [
-            max(0.0, px - half), max(0.0, py - half),
-            min(1.0, 2 * half), min(1.0, 2 * half),
+            max(0.0, px - half),
+            max(0.0, py - half),
+            min(1.0, 2 * half),
+            min(1.0, 2 * half),
         ]
         prompt_kind = "point"
     elif text:
@@ -593,10 +720,12 @@ def tracker_init(
         )
 
     # Open a SAM3 video session seeded with the first PIL image.
-    sess = predictor.handle_request({
-        "type": "start_session",
-        "resource_path": [pil],
-    })
+    sess = predictor.handle_request(
+        {
+            "type": "start_session",
+            "resource_path": [pil],
+        }
+    )
     video_session_id = sess["session_id"]
 
     # Flip is_image_only to False so the video tracker's visual-prompt +
@@ -614,24 +743,32 @@ def tracker_init(
 
     logger.debug(
         "tracker_init: prompt_kind=%s bbox_norm_xywh=%s text=%r image=%dx%d",
-        prompt_kind, bbox_norm_xywh, prompt_text, image_w, image_h,
+        prompt_kind,
+        bbox_norm_xywh,
+        prompt_text,
+        image_w,
+        image_h,
     )
     try:
         if bbox_norm_xywh is not None:
-            prompt_resp = predictor.handle_request({
-                "type": "add_prompt",
-                "session_id": video_session_id,
-                "frame_index": 0,
-                "bounding_boxes": [bbox_norm_xywh],
-                "bounding_box_labels": [1],
-            })
+            prompt_resp = predictor.handle_request(
+                {
+                    "type": "add_prompt",
+                    "session_id": video_session_id,
+                    "frame_index": 0,
+                    "bounding_boxes": [bbox_norm_xywh],
+                    "bounding_box_labels": [1],
+                }
+            )
         else:
-            prompt_resp = predictor.handle_request({
-                "type": "add_prompt",
-                "session_id": video_session_id,
-                "frame_index": 0,
-                "text": prompt_text,
-            })
+            prompt_resp = predictor.handle_request(
+                {
+                    "type": "add_prompt",
+                    "session_id": video_session_id,
+                    "frame_index": 0,
+                    "text": prompt_text,
+                }
+            )
     except Exception as e:
         logger.warning("add_prompt failed on init: %s", e, exc_info=True)
         _close_video_session(predictor, video_session_id)
@@ -652,7 +789,9 @@ def tracker_init(
         _close_video_session(predictor, video_session_id)
         logger.warning(
             "tracker_init: no object detected (prompt_kind=%s text=%r bbox=%s)",
-            prompt_kind, prompt_text, bbox_norm_xywh,
+            prompt_kind,
+            prompt_text,
+            bbox_norm_xywh,
         )
         return {
             "tracker_id": "",
@@ -678,7 +817,10 @@ def tracker_init(
 
     logger.info(
         "tracker_init created %s prompt=%s name=%r score=%.3f",
-        tracker_id, prompt_kind, object_name, score,
+        tracker_id,
+        prompt_kind,
+        object_name,
+        score,
     )
     return {
         "tracker_id": tracker_id,
@@ -724,17 +866,21 @@ def tracker_update(tracker_id: str, image: np.ndarray) -> TrackerUpdateResult:
         inference_state = sess_state_obj["state"]
 
         new_frame_idx = _streaming.add_new_frame(
-            predictor.model, inference_state, pil,
+            predictor.model,
+            inference_state,
+            pil,
         )
 
         outputs: dict | None = None
-        for resp in predictor.handle_stream_request({
-            "type": "propagate_in_video",
-            "session_id": session.video_session_id,
-            "propagation_direction": "forward",
-            "start_frame_index": new_frame_idx,
-            "max_frame_num_to_track": 1,
-        }):
+        for resp in predictor.handle_stream_request(
+            {
+                "type": "propagate_in_video",
+                "session_id": session.video_session_id,
+                "propagation_direction": "forward",
+                "start_frame_index": new_frame_idx,
+                "max_frame_num_to_track": 1,
+            }
+        ):
             outputs = resp.get("outputs")
             break
 
@@ -760,9 +906,11 @@ def tracker_update(tracker_id: str, image: np.ndarray) -> TrackerUpdateResult:
             session.consecutive_drift += 1
             logger.info(
                 "drift on tracker %s frame=%d signals=[%s] consec=%d/%d",
-                tracker_id, new_frame_idx,
+                tracker_id,
+                new_frame_idx,
                 ",".join(drift_signals),
-                session.consecutive_drift, _DRIFT_MAX_CONSECUTIVE,
+                session.consecutive_drift,
+                _DRIFT_MAX_CONSECUTIVE,
             )
             if session.consecutive_drift >= _DRIFT_MAX_CONSECUTIVE:
                 return {"mask": None, "box": None, "confidence": 0.0, "object_present": False}

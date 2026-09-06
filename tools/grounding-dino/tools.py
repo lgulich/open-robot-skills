@@ -22,7 +22,7 @@ from typing import Any, TypedDict
 
 import numpy as np
 from gap_core.errors import PerceptionFailed, ToolError
-from gap_core.tools import tool
+from gap_core.tools import tool, tool_batch
 from gap_core.types import BoundingBox2D
 
 logger = logging.getLogger(__name__)
@@ -40,13 +40,30 @@ _processor: Any = None
 
 
 class Detection(TypedDict):
-    box: BoundingBox2D    # [x1, y1, x2, y2] in pixels
-    label: str            # matched text label
-    score: float          # confidence [0, 1]
+    box: BoundingBox2D  # [x1, y1, x2, y2] in pixels
+    label: str  # matched text label
+    score: float  # confidence [0, 1]
 
 
 class DetectResult(TypedDict):
     detections: list[Detection]
+
+
+def _effective_threshold(value: float, default: float) -> float:
+    return value if value > 0 else default
+
+
+def _batch_compatibility_key(request: dict[str, Any]) -> tuple[float, float]:
+    return (
+        _effective_threshold(
+            float(request.get("box_threshold", _DEFAULT_BOX_THRESHOLD)),
+            _DEFAULT_BOX_THRESHOLD,
+        ),
+        _effective_threshold(
+            float(request.get("text_threshold", _DEFAULT_TEXT_THRESHOLD)),
+            _DEFAULT_TEXT_THRESHOLD,
+        ),
+    )
 
 
 def weights_cached() -> bool | None:
@@ -94,9 +111,7 @@ def _get_model() -> tuple[Any, Any]:
         if _model is None:
             from transformers import AutoModelForZeroShotObjectDetection, AutoProcessor
 
-            logger.info(
-                "Loading Grounding DINO model: %s on %s ...", _MODEL_NAME, _DEVICE
-            )
+            logger.info("Loading Grounding DINO model: %s on %s ...", _MODEL_NAME, _DEVICE)
             _processor = AutoProcessor.from_pretrained(_MODEL_NAME)
             model = AutoModelForZeroShotObjectDetection.from_pretrained(_MODEL_NAME)
             model = model.to(_DEVICE)
@@ -125,10 +140,15 @@ def detect(
     best box downstream (e.g. closest to a pointing-model pixel) and feed it
     to ``sam3.segment_box`` for a pixel-accurate mask.
     """
-    import torch
-    from PIL import Image
+    prepared = _prepare_request(image, query)
+    box_threshold = _effective_threshold(box_threshold, _DEFAULT_BOX_THRESHOLD)
+    text_threshold = _effective_threshold(text_threshold, _DEFAULT_TEXT_THRESHOLD)
+    results = _infer_prepared([prepared], box_threshold, text_threshold)[0]
+    return _format_result(results)
 
-    model, processor = _get_model()
+
+def _prepare_request(image: np.ndarray, query: str) -> tuple[Any, str]:
+    from PIL import Image
 
     arr = np.ascontiguousarray(np.asarray(image, dtype=np.uint8))
     if arr.ndim != 3 or arr.shape[2] != 3:
@@ -136,50 +156,89 @@ def detect(
             "grounding-dino.detect",
             f"expected RGB uint8 [H, W, 3] image, got shape {arr.shape}",
         )
-    pil_image = Image.fromarray(arr, "RGB")
+    prompt = query if query.endswith(".") else query + "."
+    return Image.fromarray(arr, "RGB"), prompt
 
-    # GDINO requires period-terminated phrases
-    text_prompt = query
-    if not text_prompt.endswith("."):
-        text_prompt = text_prompt + "."
 
-    # Defaults if zero/unset (mirrors the servicer's proto-default handling)
-    box_threshold = box_threshold if box_threshold > 0 else _DEFAULT_BOX_THRESHOLD
-    text_threshold = text_threshold if text_threshold > 0 else _DEFAULT_TEXT_THRESHOLD
+def _infer_prepared(
+    prepared: list[tuple[Any, str]],
+    box_threshold: float,
+    text_threshold: float,
+) -> list[dict[str, Any]]:
+    import torch
 
+    model, processor = _get_model()
+    images = [item[0] for item in prepared]
+    prompts = [item[1] for item in prepared]
     try:
-        inputs = processor(
-            images=pil_image, text=text_prompt, return_tensors="pt"
-        ).to(_DEVICE)
+        inputs = processor(images=images, text=prompts, padding=True, return_tensors="pt").to(
+            _DEVICE
+        )
         with torch.no_grad():
             outputs = model(**inputs)
-
-        results = processor.post_process_grounded_object_detection(
+        return processor.post_process_grounded_object_detection(
             outputs,
             inputs.input_ids,
             threshold=box_threshold,
             text_threshold=text_threshold,
-            target_sizes=[pil_image.size[::-1]],
-        )[0]
+            target_sizes=[image.size[::-1] for image in images],
+        )
     except Exception as e:
         raise PerceptionFailed(f"Grounding DINO detection failed: {e}") from e
 
+
+def _format_result(results: dict[str, Any]) -> DetectResult:
     detections: list[Detection] = []
     boxes = results["boxes"].cpu().numpy()
     scores = results["scores"].cpu().numpy()
     labels = results["labels"]
 
     for box, score, label in zip(boxes, scores, labels, strict=False):
-        detections.append({
-            "box": {
-                "x1": float(box[0]),
-                "y1": float(box[1]),
-                "x2": float(box[2]),
-                "y2": float(box[3]),
-            },
-            "label": str(label),
-            "score": float(score),
-        })
+        detections.append(
+            {
+                "box": {
+                    "x1": float(box[0]),
+                    "y1": float(box[1]),
+                    "x2": float(box[2]),
+                    "y2": float(box[3]),
+                },
+                "label": str(label),
+                "score": float(score),
+            }
+        )
 
     logger.info("grounding-dino.detect returning %d detections.", len(detections))
     return {"detections": detections}
+
+
+@tool_batch(
+    name="grounding-dino.detect",
+    max_batch_size=8,
+    max_wait_ms=10,
+    compatibility_key=_batch_compatibility_key,
+)
+def detect_batch(requests: list[dict[str, Any]]) -> list[DetectResult | BaseException]:
+    """Private serving handler; public callers continue to use ``detect``."""
+    results: list[DetectResult | BaseException | None] = [None] * len(requests)
+    prepared: list[tuple[Any, str]] = []
+    indices: list[int] = []
+    for index, request in enumerate(requests):
+        try:
+            prepared.append(_prepare_request(request["image"], str(request["query"])))
+            indices.append(index)
+        except BaseException as exc:
+            results[index] = exc
+
+    if prepared:
+        box_threshold, text_threshold = _batch_compatibility_key(requests[indices[0]])
+        try:
+            raw_results = _infer_prepared(prepared, box_threshold, text_threshold)
+            for index, raw_result in zip(indices, raw_results, strict=True):
+                results[index] = _format_result(raw_result)
+        except BaseException as exc:
+            for index in indices:
+                results[index] = exc
+
+    return [
+        result if result is not None else RuntimeError("missing batch result") for result in results
+    ]
